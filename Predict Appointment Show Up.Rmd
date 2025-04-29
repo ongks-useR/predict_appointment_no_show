@@ -1,0 +1,455 @@
+---
+title: "Medical Appointment Show Up"
+output: pdf_document
+---
+
+### Context
+
+A person makes a doctor appointment, receives all the instructions and no-show. Who to blame?
+Based on 110,000 medical appointment records, could we predict any patient will show up (**_No Show_**: _Yes_ / _No_) for doctor appointment?
+
+Refer **_[here](https://www.kaggle.com/datasets/joniarroba/noshowappointments)_** for source of data from Kaggle.
+
+```{r setup, include=FALSE}
+library(tidymodels)
+library(themis)
+library(tidyverse)
+library(vip)
+library(janitor)
+```
+
+```{r import and clean name, message=FALSE, warning=FALSE, include=FALSE}
+csv_file <- "KaggleV2-May-2016.csv"
+medic <- read_csv(csv_file) |> rename(
+  ScheduleDate = ScheduledDay,
+  AppointmentDate = AppointmentDay,
+  Hypertension = Hipertension,
+  Handicap = Handcap
+) |> clean_names()
+
+```
+
+## Exploratory Data Analysis
+
+Initial Statistical Summary as follow for gender, scheduled & appointment date, age, scholarship, hypertension, diabetes, alcoholism, handicap, 
+sms received and no show.
+
+```{r initial statistical summary, echo=FALSE}
+medic <- medic |> mutate(
+  schedule_date = as_date(schedule_date),
+  appointment_date = as_date(appointment_date),
+  gender = case_when(gender == "F" ~ "Female", TRUE ~ "Male") |> fct(),
+  patient_id = as.character(patient_id),
+  appointment_id = as.character(appointment_id),
+  scholarship = case_when(scholarship == 1 ~ "Yes", TRUE ~ "No") |> fct() |> fct_relevel("Yes", "No"),
+  hypertension = case_when(hypertension == 1 ~ "Yes", TRUE ~ "No") |> fct() |> fct_relevel("Yes", "No"),
+  diabetes = case_when(diabetes == 1 ~ "Yes", TRUE ~ "No") |> fct() |> fct_relevel("Yes", "No"),
+  alcoholism = case_when(alcoholism == 1 ~ "Yes", TRUE ~ "No") |> fct() |> fct_relevel("Yes", "No"),
+  handicap = case_when(handicap == 1 ~ "Yes", TRUE ~ "No") |> fct() |> fct_relevel("Yes", "No"),
+  sms_received = case_when(sms_received == 1 ~ "Yes", TRUE ~ "No") |> fct() |> fct_relevel("Yes", "No"),
+  no_show = fct(no_show) |> fct_relevel("Yes", "No")
+)
+
+medic |> select(-c(patient_id, appointment_id, neighbourhood)) |>
+  summary()
+```
+
+
+Medical appointment records were scheduled (_scheduled_day_) between Nov 2015 & Jun 2016 and appointments will take place April - June 2016.
+
+Notice age of patient range between -1 and 115. There are folks live up to 100+ year-old, however, -1 year-old certainly is not possible.
+Let's check this out.
+
+```{r investigate negative age, echo=FALSE}
+# pull out patient_id of the -1 year-old for investigation
+negative_age_patient <- medic |> filter(age == -1) |> pull(patient_id)
+
+medic |> filter(patient_id %in% negative_age_patient) |>
+  arrange(patient_id, appointment_id) |>
+  select(patient_id, age, appointment_id, schedule_date, appointment_date, no_show)
+```
+
+The patient of -1 year-old probably just a pregnant lady who booked a doctor appointment. Will exclude this special case from analysis since I have no way to find out the actual age of the patient.
+
+```{r exclude negative age, include=FALSE}
+medic <- medic |> filter(age != -1)
+```
+
+
+One thing got me curious is how long is the waiting period between scheduling a appointment until the appointment date.
+
+```{r waiting time, echo=FALSE}
+medic <- medic |>
+  mutate(
+    waiting_time = lubridate::time_length(lubridate::interval(schedule_date, appointment_date), unit = "day")
+  ) |>
+  select(patient_id, appointment_id, schedule_date, appointment_date, waiting_time, everything())
+
+summary(medic$waiting_time)
+```
+
+A simple summary above shows waiting time range from -6 days to 179 days. I will spend some time to figure out the negative waiting time.
+
+```{r identify negative waiting time, echo=FALSE}
+# extract patient_id with negative waiting time
+patient_with_negative_waiting_time <- medic |> filter(waiting_time < 0) |> pull(patient_id)
+
+medic |> filter(patient_id %in% patient_with_negative_waiting_time) |>
+  select(patient_id, appointment_id, schedule_date, appointment_date, waiting_time, no_show) |>
+  arrange(patient_id, appointment_id)
+```
+
+Table above clearly show some appointments with negative waiting time. Interestingly, same patient could have records with positive & negative waiting time. Technically, system should have build in mechanism to make sure appointment date is on the same day or later than schedule date. Without much information related to such records, I will assume that appointments with negative waiting time are due to system issues. Therefore, I will not use such records for analysis / prediction.
+
+For the appointments with 0 days waiting time, this is an indication that appointment and scheduling are on the same day.
+
+```{r exclude negative waiting time records, include=FALSE}
+medic <- medic |> filter(waiting_time >= 0)
+```
+
+Reproduce summary of appointment records.
+
+```{r reproduce summary, echo=FALSE}
+medic |>
+  select(
+    waiting_time, gender, age, scholarship, hypertension, diabetes, alcoholism, handicap, sms_received, no_show
+  ) |>
+  summary()
+```
+
+With the statistical summary, I may proceed to find out more about the most frequent waiting time for the appointments.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+ggplot(medic, aes(waiting_time)) +
+  theme_minimal() +
+  geom_density(binwidth = 1, aes(fill = no_show, colour = no_show), alpha = 0.2) +
+  labs(
+    title = "Most Frequent Waiting Time",
+    x = "Days After Schedule Date",
+    y = "Density",
+    caption = "Figure 1"
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  lims(x = c(0, 50)) +
+  # Change title of legend
+  scale_fill_discrete(name = "No Show") +
+  scale_colour_discrete(name = "No Show")
+```
+
+Observed from Figure 1, thought waiting time can range from 0 (same day) to 179 days (6 months), most appointments will either take place on the same day of scheduling the appointment or within 7 days after schedule date. This is especially true for patients who did show up (_No Show -> No_) for the appointments.
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+medic |>
+  group_by(sms_received, no_show) |> summarise(total = n()) |>
+  mutate(percentage = round(total / sum(total), 2)) |>
+  ggplot(aes(sms_received, percentage, fill = no_show)) +
+  theme_minimal() +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Impact of SMS Reminder on No Show",
+    caption = "Figure 2",
+    x = "SMS Reminder",
+    y = NULL
+  ) +
+  scale_fill_discrete(name = "No Show")
+```
+
+Logically, SMS reminder helps to remind patient for appointment. However, Figure 2 tell different story. Most patients (> 60%) showed up for appointments (_No Show == No_), regardless they received SMS reminder.
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+ggplot(medic, aes(age, fill = no_show, colour = no_show)) +
+  theme_minimal() +
+  geom_density(alpha = 0.3) +
+  labs(
+    title = "Does older people tend to miss appointment?",
+    caption = "Figure 3",
+    x = "Age (Year-Old)",
+    y = "Density"
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_discrete(name = "No Show") +
+  scale_colour_discrete(name = "No Show")
+```
+
+Based on Figure 3, people from different age group between 0 - 60 year-old primarily, are the majority of patients. However, there is no clear indication that patients who did not show up for appointments belong to certain age range.
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.width=10}
+p1 <- medic |>
+  group_by(handicap, no_show) |> summarise(total = n()) |>
+  mutate(percentage = round(total / sum(total), 2)) |>
+  ggplot(aes(handicap, percentage, fill = no_show)) +
+  theme_minimal() +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Impact of Handicap",
+    caption = "Figure 4",
+    x = "Handicap",
+    y = NULL
+  ) +
+  scale_fill_discrete(name = "No Show")
+
+p2 <- medic |>
+  group_by(alcoholism, no_show) |> summarise(total = n()) |>
+  mutate(percentage = round(total / sum(total), 2)) |>
+  ggplot(aes(alcoholism, percentage, fill = no_show)) +
+  theme_minimal() +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Impact of Alcoholism",
+    caption = "Figure 5",
+    x = "Alcoholism",
+    y = NULL
+  ) +
+  scale_fill_discrete(name = "No Show")
+
+p3 <- medic |>
+  group_by(hypertension, no_show) |> summarise(total = n()) |>
+  mutate(percentage = round(total / sum(total), 2)) |>
+  ggplot(aes(hypertension, percentage, fill = no_show)) +
+  theme_minimal() +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Impact of Hypertension",
+    caption = "Figure 6",
+    x = "Hypertension",
+    y = NULL
+  ) +
+  scale_fill_discrete(name = "No Show")
+
+p4 <- medic |>
+  group_by(diabetes, no_show) |> summarise(total = n()) |>
+  mutate(percentage = round(total / sum(total), 2)) |>
+  ggplot(aes(diabetes, percentage, fill = no_show)) +
+  theme_minimal() +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Impact of Diabetes",
+    caption = "Figure 7",
+    x = "Diabetes",
+    y = NULL
+  ) +
+  scale_fill_discrete(name = "No Show")
+
+gridExtra::grid.arrange(p1, p2, p3, p4, nrow = 2)
+
+```
+
+Figure 4, 5, 6 & 7 try to identify whether conditions such as handicap, alcoholism, hypertension and / or diabetes are in some ways preventing a patient from showing up for doctor appointment. If it does, I should expect to see opposite result between Yes & No given a condition. For example, by referring to Figure 4, the chart clearly shows no difference in outcome (No Show) given a patient is a handicap person; whether the patient is a handicap person, the percentage of No Show (No Show = Yes) is at ~ 20%.
+
+
+## Statistical Modelling with Logistic Regression
+
+With all the basic analyses about waiting time, SMS reminder, age, impact of various health conditions, I will move on to predict whether a patient will show up for doctor appointment.
+
+My hypothesis is that, older patient who has appointment months into the future, without sms reminder tend to forget about doctor appointment. Therefore, **_age_**, **_waiting_time_** and **_sms_received_** should be the top predictors to tell whether a patient would show up (**_no_show_**) for doctor appointment.
+
+However, I would first build a predictive model by including waiting_time, gender, age, scholarship, hypertension, diabetes, alcoholism, handicap and sms_received first then narrow down the selection of predictors later.
+
+
+```{r preparation, message=FALSE, include=FALSE}
+
+all_patientID <- medic |> distinct(patient_id) |> pull()
+
+# Use 6000 patient ID as 1st batch of training data
+sample_1 <- medic |>
+  select(-c(appointment_id, schedule_date, appointment_date, neighbourhood)) |>
+  filter(patient_id %in% all_patientID[1:6000])
+
+# create recipe to train logistic model
+set.seed(100)
+recipe_1 <- recipe(
+  no_show ~ waiting_time + gender + age + scholarship + hypertension + diabetes + alcoholism + handicap + sms_received,
+  data = sample_1
+  ) |>
+  # Yes vs No in no_show is 20% vs 80%. down sample the No outcome
+  step_downsample(no_show) |>
+  # scale and center all numeric predictors
+  step_normalize(all_numeric_predictors()) |> 
+  # encoding all predictors of string / factor data types
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+```
+
+```{r summarise recipe, echo=FALSE, message=TRUE}
+tidy(recipe_1)
+```
+
+```{r summarise recipe pt2, echo=FALSE, message=TRUE}
+summary(recipe_1)
+```
+
+
+Train logistic model and identify p-values for each relevant indicators.
+
+```{r create workflow for prediction, message=FALSE, include=FALSE}
+log_workflow <- workflow() |> add_model(logistic_reg())
+```
+
+```{r trained model, echo=FALSE}
+train_result <- log_workflow |> add_recipe(recipe_1) |> fit(data = sample_1)
+extract_fit_parsnip(train_result) |> tidy(exponentiate = TRUE) |>
+  mutate(p.value = round(p.value, 4)) |>
+  filter(p.value < 0.05) |>
+  arrange(p.value)
+```
+
+
+```{r importance of predictors, echo=FALSE}
+vip::vip(train_result) + labs(
+  title = "Predictor Ranking",
+  caption = "Figure 8"
+)
+```
+
+Trained model derived from 6000 patients appointment records show that waiting_time, age, sms_received, scholarship and alcoholism have the most impact on appointment no show. This is indicated by the p-value, which is below 0.05 (i.e: 95% confidence level). **_Predictor Ranking_** (Figure 8) is also align with the trained model statistic.
+
+I will pick predictors with importance score above 5.0 to retrain the model: waiting time, age and sms_received.
+
+
+```{r preparation pt2, message=FALSE, include=FALSE}
+
+sample_2 <- medic |>
+  select(-c(appointment_id, schedule_date, appointment_date, neighbourhood)) |>
+  filter(patient_id %in% all_patientID[1:6000])
+
+# create recipe to train logistic model
+set.seed(101)
+recipe_2 <- recipe(
+  no_show ~ waiting_time + age + sms_received,
+  data = sample_2
+  ) |>
+  # Yes vs No in no_show is 20% vs 80%. down sample the No outcome
+  step_downsample(no_show) |>
+  # scale and center all numeric predictors
+  step_normalize(all_numeric_predictors()) |> 
+  # encoding all predictors of string / factor data types
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+```
+
+
+```{r summarise recipe 2, echo=FALSE, message=TRUE}
+summary(recipe_2)
+```
+
+## Predict No Show with Model
+
+Below is the statistical result after retrain logistic model with only waiting time, age and sms_received.
+
+
+```{r trained model v2, echo=FALSE}
+train_result_2 <- log_workflow |> add_recipe(recipe_2) |> fit(data = sample_2)
+t <- extract_fit_parsnip(train_result_2) |> tidy(exponentiate = TRUE) |>
+  filter(p.value < 0.05) |>
+  mutate(p.value = round(p.value, 4))
+
+t
+```
+
+
+p-values of the predictors remain below 0.05.
+
+The coefficient values (refer to: **_estimate_**) indicates the _impact_ of each predictor on the outcome (_no_show_). The coefficient of **_age_** is _`r round(t$estimate[3], 4)`_. The positive value mean the _chance of a patient not showing up for an appointment increases as age increases_. The value itself indicates the magnitude of the impact; higher value mean greater impact. Same concept is applicable to waiting time and sms received, which mean patient has the tendency not to show up for appointment when waiting time is longer and he / she received SMS reminder.
+
+Here is preview of new table includes actual outcome (no_show), waiting time, age, sms_received and the rest are predicted outcome & probabilities.
+**_.pred_class_** is the predicted outcome (Yes / No), **_.pred_Yes_** & **_.pred_No_** are the probability that appointment will be "Yes" & "No" respectively.
+
+```{r predicted outcomes, echo=FALSE}
+outcome.df <- medic |> filter(patient_id %in% all_patientID[6001:12000]) |>
+  select(no_show, waiting_time, age, sms_received) |>
+  bind_cols(
+    predict(train_result_2, new_data = medic |> filter(patient_id %in% all_patientID[6001:12000]), type = "class"),
+    predict(train_result_2, new_data = medic |> filter(patient_id %in% all_patientID[6001:12000]), type = "prob")
+  )
+
+slice_head(outcome.df, n = 5)
+```
+
+All said, let's see how well my prediction is.
+
+Below is confusion matrix that compares Actual (_Truth_) and _Prediction_ for each outcome (Yes / No). 
+
+```{r confusion matrix, echo=FALSE}
+m <- conf_mat(outcome.df, truth = no_show, estimate = .pred_class)
+m
+```
+
+The model is applied to predict `r scales::comma(sum(m$table))` appointments. Actual no show is `r scales::comma(sum(m$table[1], m$table[2]))` (Yes under Truth: `r scales::comma(m$table[1])` + `r scales::comma(m$table[2])`) and total show up is `r scales::comma(sum(m$table[3], m$table[4]))` (No under Truth: `r scales::comma(m$table[3])` + `r scales::comma(m$table[4])`). Predicted no show is `r scales::comma(sum(m$table[1], m$table[3]))` (Prediction with Yes: `r scales::comma(m$table[1])` + `r scales::comma(m$table[3])`) and total show up is `r scales::comma(sum(m$table[2], m$table[4]))` (Prediction with No: `r scales::comma(m$table[2])` + `r scales::comma(m$table[4])`).
+
+Performance of my prediction is summarized as follow with metrics such as _Accuracy_, _Sensitivity_ & _Specificity_.
+
+
+```{r metrics for measurement, echo=FALSE}
+# Refer to article (https://medium.com/the-researchers-guide/modelling-binary-logistic-regression-using-tidymodels-library-in-r-part-1-c1bdce0ac055) for metrics detail.
+
+create_metrics <- metric_set(accuracy, sens, yardstick::spec, precision, f_meas, mcc)
+metrics <- create_metrics(outcome.df, truth = no_show, estimate = .pred_class)
+metrics
+```
+
+
+Metrics that worth attention:
+
+1. _Accuracy = `r round(metrics$.estimate[1], 4)`_
+
+I predicted `r scales::comma(m$table[1])` correctly for Yes (Yes for Truth & Prediction) and `r scales::comma(m$table[4])` correctly for No (No for Truth & Prediction) out of total `r scales::comma(sum(m$table))` appointments. Overall prediction is about `r scales::percent(sum(m$table[1], m$table[4]) / sum(m$table))` accurate (`r scales::comma(m$table[1])` + `r scales::comma(m$table[4])` correct / total `r scales::comma(sum(m$table))`).
+
+2. _Sensitivity = `r round(metrics$.estimate[2], 4)`_
+
+This metric only focus on accurate prediction for _Yes_ outcome. 
+Yes for Truth is `r scales::comma(sum(m$table[1], m$table[2]))` (Yes under Truth: `r scales::comma(m$table[1])` + `r scales::comma(m$table[2])`) and my prediction recorded `r scales::comma(m$table[1])` as Yes. ~ `r scales::percent(m$table[1] / sum(m$table[1], m$table[2]))` (`r scales::comma(m$table[1])` / `r scales::comma(sum(m$table[1], m$table[2]))`) of my prediction for Yes only is correct. The entire analysis is about predict whether a patient will NOT show up for appointment, hence my model accuracy is slightly higher than predicting Head or Tail of flipping a coin.
+
+3. _Specificity = `r round(metrics$.estimate[3], 4)`_
+
+This metric only focus on accurate prediction for _No_ outcome. This is the opposite of Sensitivity metric.
+No for Truth is `r scales::comma(sum(m$table[3], m$table[4]))` (No under Truth: `r scales::comma(m$table[3])` + `r scales::comma(m$table[4])`) and my prediction recorded `r scales::comma(m$table[4])` as No. ~ `r scales::percent(m$table[4] / sum(m$table[3], m$table[4]))` (`r scales::comma(m$table[4])` / `r scales::comma(sum(m$table[3], m$table[4]))`) of my prediction for No only is correct. My model is doing better job when predicting a patient will show up (`r scales::percent(m$table[4] / sum(m$table[3], m$table[4]))`) for appointment instead of NOT showing up (`r scales::percent(m$table[1] / sum(m$table[1], m$table[2]))`).
+
+
+We can visually inspect how well the predictive model perform.
+
+From Figure 9 below, probability of NOT showing up trend higher as waiting time increases. Probability of NOT showing up is higher for the appointments where the patients received SMS reminder given the same waiting time.
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+ggplot(outcome.df, aes(waiting_time, .pred_Yes, colour = sms_received)) +
+  theme_light() +
+  geom_jitter(alpha = 0.2) +
+  geom_smooth(colour = "black") +
+  labs(
+    title = "Predicted Outcome of Waiting Time + SMS Reminder",
+    caption = "Figure 9",
+    x = "Waiting Time - Days",
+    y = "Model Probability"
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_colour_discrete(name = "SMS Received")
+```
+
+
+However, Figure 10 below shows degradation of model performance when age is included as part of the predictive model on top of waiting time & sms received (refer to left chart of Figure 10). The direction of trend line for No Show = Yes is not obvious.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.width=10}
+ggplot(outcome.df, aes(age, waiting_time, colour = .pred_class)) +
+  theme_light() +
+  geom_jitter(alpha = 0.3) +
+  geom_smooth(aes(colour = .pred_class)) +
+  labs(
+    title = "Predicted Outcome as Age & Waiting Time Increases with SMS Reminder",
+    caption = "Figure 10",
+    x = "Age [ Year Old ]",
+    y = "Waiting Time - Days"
+  ) +
+  facet_grid(. ~ sms_received) +
+  scale_colour_discrete(name = "No Show")
+```
+
+
